@@ -5,6 +5,7 @@ import os
 
 class ModelConfig(BaseModel):
     name: str = Field(default="rife-v4.6")
+    expected_sha256: Optional[str] = Field(default=None, description="Expected SHA256 checksum for the model file.")
     fp16: bool = Field(default=True, description="Use FP16 for faster inference if supported.")
 
 class ProcessingConfig(BaseModel):

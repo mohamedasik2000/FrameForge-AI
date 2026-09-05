@@ -31,7 +31,7 @@ class Pipeline:
         logger.info(f"Preparing pipeline for {self.input_path}")
         
         # 1. System check
-        check_gpu()
+        check_gpu(gpu_id=self.config.processing.gpu_id)
         
         # 2. Inspect video
         if not os.path.exists(self.input_path):
@@ -53,7 +53,8 @@ class Pipeline:
         self.interpolator = RIFEInterpolator(
             fp16=self.config.model.fp16,
             scale=self.config.processing.scale,
-            gpu_id=self.config.processing.gpu_id
+            gpu_id=self.config.processing.gpu_id,
+            expected_sha256=self.config.model.expected_sha256
         )
         self.interpolator.load_model() # Will download if missing
         

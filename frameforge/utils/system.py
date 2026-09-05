@@ -34,17 +34,26 @@ def setup_logging(verbose: bool = False):
         datefmt="%H:%M:%S"
     )
 
-def check_gpu():
+def check_gpu(gpu_id: int = 0):
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. An NVIDIA GPU is required for this application.")
     
     device_count = torch.cuda.device_count()
-    gpu_name = torch.cuda.get_device_name(0)
-    logger.info(f"Detected {device_count} GPU(s). Primary GPU: {gpu_name}")
+    if gpu_id >= device_count:
+        raise RuntimeError(f"Requested GPU {gpu_id} but only {device_count} GPU(s) available.")
+        
+    gpu_name = torch.cuda.get_device_name(gpu_id)
+    logger.info(f"Detected {device_count} GPU(s). Using GPU {gpu_id}: {gpu_name}")
     
     # Check PyTorch version and CUDA version
     logger.info(f"PyTorch Version: {torch.__version__}")
     logger.info(f"CUDA Version (compiled with PyTorch): {torch.version.cuda}")
     
+    # Verify we can allocate a tiny tensor on the target device
+    try:
+        _ = torch.zeros(1).to(f"cuda:{gpu_id}")
+    except RuntimeError as e:
+        raise RuntimeError(f"Failed to initialize CUDA device {gpu_id}. Check your drivers and PyTorch installation. Error: {e}")
+        
     return True

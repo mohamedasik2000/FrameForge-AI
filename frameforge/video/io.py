@@ -70,7 +70,7 @@ class FFmpegEncoder:
             "-vcodec", "rawvideo",
             "-s", f"{self.width}x{self.height}",
             "-pix_fmt", "rgb24",
-            "-r", str(self.target_fps),
+            "-framerate", str(self.target_fps), # strict CFR input frame rate
             "-i", "-", # Input 0: raw frames from stdin
         ]
 
@@ -83,14 +83,18 @@ class FFmpegEncoder:
             "-preset", self.config.get("preset", "medium"),
             "-crf", str(self.config.get("crf", 18)),
             "-pix_fmt", self.config.get("pixel_format", "yuv420p"),
+            "-r", str(self.target_fps) # Ensure strict CFR output
         ])
         
         # Audio mapping and encoding settings
         if self.has_audio and self.config.get("preserve_audio", True):
+            # If output is mp4, copy might fail if original is an unsupported codec like FLAC or PCM
+            # For robustness, we will use aac by default unless specified
+            audio_codec = self.config.get("audio_codec", "aac" if self.output_path.lower().endswith(".mp4") else "copy")
             cmd.extend([
                 "-map", "0:v",   # Take video from input 0 (stdin)
                 "-map", "1:a?",  # Take audio from input 1 (original video)
-                "-c:a", self.config.get("audio_codec", "copy"),
+                "-c:a", audio_codec,
                 "-shortest"      # End encoding when the shortest stream ends
             ])
         else:
@@ -118,6 +122,29 @@ class FFmpegEncoder:
             _, stderr = self.process.communicate()
             raise RuntimeError(f"FFmpeg encoder crashed: {stderr.decode()}")
 
+    def _validate_output(self):
+        """Run ffprobe on the output part file to ensure it's a valid video."""
+        try:
+            cmd = [
+                "ffprobe", 
+                "-v", "error", 
+                "-select_streams", "v:0", 
+                "-show_entries", "stream=duration,nb_frames,r_frame_rate", 
+                "-of", "default=noprint_wrappers=1:nokey=1", 
+                self.part_path
+            ]
+            output = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+            lines = output.strip().split("\n")
+            if not lines or len(lines) < 2:
+                logger.warning("ffprobe could not determine output validity.")
+                return
+            logger.info(f"Output validation passed: {output.strip().replace(chr(10), ' | ')}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFprobe validation failed: {e.output}")
+            raise RuntimeError(f"Output video {self.part_path} failed validation and may be corrupt.")
+        except FileNotFoundError:
+            logger.warning("ffprobe not found. Skipping output validation.")
+
     def close(self):
         if self.process:
             self.process.stdin.close()
@@ -126,7 +153,8 @@ class FFmpegEncoder:
                 stderr = self.process.stderr.read().decode()
                 raise RuntimeError(f"FFmpeg encoder failed with code {self.process.returncode}. stderr: {stderr}")
             else:
-                # Atomic rename on success
+                # Validate before atomic rename
+                self._validate_output()
                 if os.path.exists(self.output_path):
                     os.remove(self.output_path)
                 os.rename(self.part_path, self.output_path)

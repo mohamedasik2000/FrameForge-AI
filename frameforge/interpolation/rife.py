@@ -2,73 +2,106 @@ import os
 import torch
 import numpy as np
 import logging
-from typing import Any
 import requests
-import zipfile
 import hashlib
 from tqdm import tqdm
+import shutil
 
 from .base import Interpolator
-
-# Adjust import path for the embedded RIFE model
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), "models", "rife"))
-from RIFE import Model
+from .models.rife.RIFE import Model
 
 logger = logging.getLogger(__name__)
 
 # Fallback verified URL for v4.6 weights (if available on huggingface or github)
-# Note: For production, this should point to a stable mirror.
 DEFAULT_WEIGHTS_URL = "https://github.com/styler00dollar/VapourSynth-RIFE-ncnn-Vulkan/releases/download/models/rife46.pth"
 
 class RIFEInterpolator(Interpolator):
-    def __init__(self, fp16: bool = True, scale: float = 1.0, gpu_id: int = 0):
+    def __init__(self, fp16: bool = True, scale: float = 1.0, gpu_id: int = 0, expected_sha256: str = None):
         self.fp16 = fp16
         self.scale = scale
         self.device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
+        if self.device.type != 'cuda':
+            raise RuntimeError("CUDA is required for RIFE interpolation, but no CUDA device was found.")
         self.model = None
+        self.expected_sha256 = expected_sha256
+
+    def _verify_checksum(self, filepath: str, expected_hash: str) -> bool:
+        if not expected_hash:
+            logger.warning("No expected SHA-256 checksum provided; skipping verification.")
+            return True
+        logger.info("Verifying model checksum...")
+        sha256_hash = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        actual_hash = sha256_hash.hexdigest()
+        logger.info(f"Actual Hash:   {actual_hash}")
+        logger.info(f"Expected Hash: {expected_hash}")
+        return actual_hash.lower() == expected_hash.lower()
 
     def _download_weights(self, cache_dir: str, url: str) -> str:
         os.makedirs(cache_dir, exist_ok=True)
-        # Using a fixed name for the downloaded weights
-        weights_path = os.path.join(cache_dir, "flownet.pkl")
+        # Using rife46.pth or flownet.pkl depending on the URL
+        filename = url.split('/')[-1]
+        weights_path = os.path.join(cache_dir, filename)
         
         if os.path.exists(weights_path):
-            logger.info(f"Model weights found at {weights_path}")
-            return weights_path
+            if self._verify_checksum(weights_path, self.expected_sha256):
+                logger.info(f"Verified model weights found at {weights_path}")
+                return weights_path
+            else:
+                logger.warning(f"Existing model weights at {weights_path} failed checksum validation. Redownloading...")
+                os.remove(weights_path)
 
+        tmp_path = weights_path + ".tmp"
         logger.info(f"Downloading model weights from {url}...")
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        total_size = int(response.headers.get('content-length', 0))
-        block_size = 1024
-        
-        with open(weights_path, 'wb') as f:
-            for data in tqdm(response.iter_content(block_size), total=total_size//block_size, unit='KB'):
-                f.write(data)
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            block_size = 1024
+            
+            with open(tmp_path, 'wb') as f:
+                for data in tqdm(response.iter_content(block_size), total=total_size//block_size, unit='KB'):
+                    f.write(data)
+            
+            # Verify checksum on the temp file before renaming
+            if not self._verify_checksum(tmp_path, self.expected_sha256):
+                raise ValueError("Downloaded model failed SHA-256 checksum verification!")
                 
-        logger.info("Download complete.")
-        return weights_path
+            os.rename(tmp_path, weights_path)
+            logger.info("Download and verification complete.")
+            return weights_path
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise e
 
-    def load_model(self, model_dir: str = None):
+    def load_model(self, model_dir: str = None, model_filename: str = None):
         if model_dir is None:
             # Default to local cache
-            model_dir = os.path.join(os.path.dirname(__file__), "..", "..", "models", "rife-v4.6")
+            model_dir = os.path.join(os.path.expanduser("~"), ".cache", "frameforge", "models", "rife-v4.6")
             
-        weights_path = os.path.join(model_dir, "flownet.pkl")
+        if model_filename is None:
+            model_filename = "rife46.pth"
+            
+        weights_path = os.path.join(model_dir, model_filename)
+        
         if not os.path.exists(weights_path):
-            # Attempt to download
             try:
-                self._download_weights(model_dir, DEFAULT_WEIGHTS_URL)
+                weights_path = self._download_weights(model_dir, DEFAULT_WEIGHTS_URL)
             except Exception as e:
                 logger.error(f"Failed to automatically download weights: {e}")
-                logger.error("Please place 'flownet.pkl' in the models directory manually.")
+                logger.error(f"Please place '{model_filename}' in {model_dir} manually.")
                 raise e
+        else:
+            if not self._verify_checksum(weights_path, self.expected_sha256):
+                raise ValueError("Cached model failed SHA-256 checksum verification. Delete the file to redownload.")
 
         # Initialize the model using the embedded RIFE code
-        self.model = Model()
-        self.model.load_model(model_dir, -1)
+        self.model = Model(arbitrary=True) # use IFNet_m for arbitrary timestep
+        self.model.load_model(weights_path, -1)
         self.model.eval()
         self.model.device()
         
@@ -98,7 +131,7 @@ class RIFEInterpolator(Interpolator):
             mid = self.model.inference(I0, I1, scale=self.scale, timestep=timestep)
             
             # Convert back to numpy (H, W, C)
-            mid = (mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)
+            mid = (mid[0] * 255.).clamp(0, 255).byte().cpu().numpy().transpose(1, 2, 0)
             return mid
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
